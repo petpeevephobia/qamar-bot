@@ -2,6 +2,10 @@
 name = "python-template"
 version = "0.1.0"
 description = ""
-authors = ["Your Name <you@example.com>"]
+authors = ["Nadra <qamaria.mdsah@gmail.com>"]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "openai>=1.82.0",
+    "requests>=2.32.3",
+    "telegram>=0.0.1",
+]
