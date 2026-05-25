@@ -1,9 +1,10 @@
-coding
-project
-genai
+aiml
 bot
+coding
 democracy
+diversitycommunity
+genai
 governance
-rousseau
 politicaltheory
-diversity
+project
+rousseau

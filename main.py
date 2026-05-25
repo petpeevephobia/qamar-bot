@@ -13,14 +13,30 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # APIs
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters
+)
 from google import genai
 from google.genai import types
 from groq import Groq
 from googleapiclient.errors import HttpError
 
-from drive_client import DriveAuthRequiredError, build_reauth_url, get_drive_service, save_note_to_drive
+from drive_client import (
+    DriveAuthRequiredError,
+    build_reauth_url,
+    delete_note_by_id,
+    download_note_content,
+    get_drive_service,
+    get_most_recent_note,
+    list_vault_notes,
+    save_note_to_drive,
+)
 from oauth_app import app as fastapi_app
 
 now = datetime.datetime.now()
@@ -42,6 +58,9 @@ with open("brain/template.md", "r") as f:
     note_template = f.read()
 
 TAGS_FILE = "brain/tags.txt"
+
+DELETE_CONFIRM = "delete_confirm"
+DELETE_CANCEL = "delete_cancel"
 
 
 #####################################################################################################################################################################
@@ -84,6 +103,33 @@ def append_new_tags(used_tags: list[str]) -> list[str]:
     return new_tags
 
 
+def collect_tags_in_vault(drive_service, exclude_id: str | None = None) -> set[str]:
+    tags: set[str] = set()
+    for note in list_vault_notes(drive_service):
+        if exclude_id and note["id"] == exclude_id:
+            continue
+        content = download_note_content(drive_service, note["id"])
+        tags.update(extract_tags_from_markdown(content))
+    return tags
+
+
+def prune_orphan_tags(deleted_file_tags: list[str], tags_still_in_vault: set[str]) -> list[str]:
+    """Remove from tags.txt any tag that was only on the deleted note."""
+    still_used = {t.lower() for t in tags_still_in_vault}
+    orphan_candidates = {t.lower() for t in deleted_file_tags} - still_used
+    if not orphan_candidates:
+        return []
+    current = load_tags()
+    removed = sorted(t for t in current if t in orphan_candidates)
+    if not removed:
+        return []
+    with open(TAGS_FILE, "w", encoding="utf-8") as f:
+        for tag in current:
+            if tag not in orphan_candidates:
+                f.write(f"{tag}\n")
+    return removed
+
+
 # Ensure file name saved in Drive is of the correct format and causes no conflict
 def note_filename_from_markdown(markdown: str) -> str:
     match = re.search(r"^#\s+(.+)$", markdown, re.MULTILINE)
@@ -95,6 +141,11 @@ def note_filename_from_markdown(markdown: str) -> str:
 
 
 # Prompt user to reauth Google Drive access
+def format_drive_created_time(created_time_rfc3339: str) -> str:
+    dt = datetime.datetime.fromisoformat(created_time_rfc3339.replace("Z", "+00:00"))
+    return dt.astimezone(TZ).strftime("%d-%m-%Y %H:%M")
+
+
 def drive_auth_reply() -> str:
     try:
         url = build_reauth_url()
@@ -121,7 +172,8 @@ def run_http_server():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hey! I'm Qamar. I help organise your brain dumps in Obsidian. Tell me your idea in a voice note and I'll remember that for you.\n\n"
-        "Use /reauth if Google Drive needs reconnecting."
+        "Use /reauth if Google Drive needs reconnecting.\n"
+        "Use /delete to remove your most recently saved note (you'll be asked to confirm)."
     )
 
 
@@ -135,6 +187,81 @@ async def reauth(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     await update.message.reply_text(f"Reconnect Google Drive:\n{url}")
+
+
+# /delete
+async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        note = get_most_recent_note(get_drive_service())
+        if note is None:
+            await update.message.reply_text("No notes found in Drive to delete.")
+            return
+
+        context.user_data["pending_delete_id"] = note["id"]
+        context.user_data["pending_delete_name"] = note["name"]
+        created = format_drive_created_time(note["createdTime"])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Yes, delete", callback_data=DELETE_CONFIRM),
+                    InlineKeyboardButton("Cancel", callback_data=DELETE_CANCEL),
+                ]
+            ]
+        )
+        print(f"[DEBUG {now}] Delete requested for: {note['name']} (created {created}) — awaiting confirmation")
+        await update.message.reply_text(
+            f"Most recent note:\n"
+            f"Name: {note['name']}\n"
+            f"Created: {created}\n\n"
+            "Delete this file from Drive?",
+            reply_markup=keyboard,
+        )
+    except DriveAuthRequiredError:
+        await update.message.reply_text(drive_auth_reply())
+    except (HttpError, ValueError) as e:
+        print(f"[ERROR {now}] Drive lookup failed: {e}")
+        await update.message.reply_text("Could not find the note. Check the bot logs.")
+
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == DELETE_CANCEL:
+        file_name = context.user_data.pop("pending_delete_name", None)
+        context.user_data.pop("pending_delete_id", None)
+        print(f"[DEBUG {now}] Delete rejected: {file_name or 'unknown'}")
+        await query.edit_message_text("Delete cancelled.")
+        return
+
+    if query.data != DELETE_CONFIRM:
+        return
+
+    file_id = context.user_data.pop("pending_delete_id", None)
+    file_name = context.user_data.pop("pending_delete_name", None)
+    if not file_id:
+        await query.edit_message_text("This confirmation expired. Run /delete again.")
+        return
+
+    print(f"[DEBUG {now}] Delete confirmed: {file_name or file_id}")
+    try:
+        drive = get_drive_service()
+        deleted_content = download_note_content(drive, file_id)
+        deleted_tags = extract_tags_from_markdown(deleted_content)
+        tags_in_other_notes = collect_tags_in_vault(drive, exclude_id=file_id)
+        removed_tags = prune_orphan_tags(deleted_tags, tags_in_other_notes)
+        deleted_name = delete_note_by_id(drive, file_id)
+
+        reply_text = f"Deleted from Drive: {deleted_name}"
+        if removed_tags:
+            reply_text += f"\nRemoved unused tags: {', '.join(removed_tags)}"
+            print(f"[DEBUG {now}] Tags removed from {TAGS_FILE}: {', '.join(removed_tags)}")
+        await query.edit_message_text(reply_text)
+    except DriveAuthRequiredError:
+        await query.edit_message_text(drive_auth_reply())
+    except (HttpError, ValueError) as e:
+        print(f"[ERROR {now}] Drive delete failed: {e}")
+        await query.edit_message_text("Could not delete the note. Check the bot logs.")
 
 
 # WHEN USER SENDS A VOICE MESSAGE
@@ -164,9 +291,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = gemini_client.models.generate_content(
             model=gemini_model,
             contents=(
-                "Don't reply to the user. Produce only content in a markdown file that contains "
-                "the new idea shared by the user. Refine the idea where possible. Reuse as much of "
-                "the user's words as possible in the markdown.\n"
+                "Don't reply to the user. Produce only content in a markdown file that contains the new idea shared by the user. Refine the idea while reusing the user's words in the markdown.\n"
                 f"This is the markdown file template that you must strictly follow: {note_template}\n"
                 "Tag rules:\n"
                 f"- Existing tags in the vault (reuse the most appropriate ones first, but create new ones only if needed): "
@@ -219,6 +344,10 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reauth", reauth))
+    app.add_handler(CommandHandler("delete", delete))
+    app.add_handler(
+        CallbackQueryHandler(delete_callback, pattern=f"^({DELETE_CONFIRM}|{DELETE_CANCEL})$")
+    )
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     print(f"Qamar is live (OAuth server on port {HTTP_PORT}).")

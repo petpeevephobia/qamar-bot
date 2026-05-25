@@ -9,7 +9,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 load_dotenv()
 
@@ -137,3 +137,69 @@ def save_note_to_drive(drive_service, markdown: str, upload_filename: str) -> st
         GOOGLE_DRIVE_FOLDER_ID,
     )
     return upload_filename
+
+
+def _vault_md_query() -> str:
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        raise ValueError(
+            "GOOGLE_DRIVE_FOLDER_ID is not set in .env. Add the folder ID from your Drive URL."
+        )
+    return (
+        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed=false and "
+        "(mimeType='text/markdown' or name contains '.md')"
+    )
+
+
+def list_vault_notes(drive_service) -> list[dict]:
+    """Return {id, name} for every markdown note in the vault folder."""
+    notes: list[dict] = []
+    page_token = None
+    while True:
+        results = (
+            drive_service.files()
+            .list(
+                q=_vault_md_query(),
+                fields="nextPageToken, files(id, name)",
+                pageSize=100,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        notes.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    return notes
+
+
+def download_note_content(drive_service, file_id: str) -> str:
+    request = drive_service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue().decode("utf-8")
+
+
+def get_most_recent_note(drive_service) -> dict | None:
+    """Return {id, name, createdTime} for the newest markdown file in the vault, or None."""
+    results = (
+        drive_service.files()
+        .list(
+            q=_vault_md_query(),
+            orderBy="createdTime desc",
+            pageSize=1,
+            fields="files(id, name, createdTime)",
+        )
+        .execute()
+    )
+    files = results.get("files", [])
+    return files[0] if files else None
+
+
+def delete_note_by_id(drive_service, file_id: str) -> str:
+    """Permanently delete a Drive file by id. Returns the deleted file's name."""
+    meta = drive_service.files().get(fileId=file_id, fields="name").execute()
+    drive_service.files().delete(fileId=file_id).execute()
+    return meta["name"]
