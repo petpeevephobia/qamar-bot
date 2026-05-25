@@ -1,100 +1,45 @@
 import os
-import requests
+import json
+import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 import tempfile
-from openai import OpenAI, Audio
-import json
+from google import genai
+from google.genai import types
+from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
+now = datetime.datetime.now()
 
-
-
-
-# Environment setup
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ORG_KEY = os.getenv("ORG_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY, organization=ORG_KEY)
-# Set memory file
-MEMORY_FILE = "memory.json"
-# TTS Settings
-voice = "echo"  # or "shimmer", "echo", etc.
 
-# Load Qamar's role from separate file
-with open("qamar_role.txt", "r") as f:
+gemini_client = genai.Client(api_key=os.getenv("GOOGLE_GEMINI_API"))
+gemini_model = "gemini-2.5-flash"
+
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+groq_model = "whisper-large-v3"
+
+# Load Qamar's role from qamar_role.txt
+with open("brain/qamar_role.txt", "r") as f:
     qamar_system_prompt = f.read()
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r") as f:
-            return json.load(f)
-    return {}
-def save_memory(data):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-# Load memory at runtime
-qamar_memory = load_memory()
-
-# Set web surfing
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
-def web_search(query):
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query,
-        "num": 3
-    }
-    response = requests.get(url, params=params)
-    data = response.json()
-
-    snippets = []
-    if "items" in data:
-        for item in data["items"]:
-            title = item.get("title", "")
-            snippet = item.get("snippet", "")
-            link = item.get("link", "")
-            snippets.append(f"- {title}\n  {snippet}\n  {link}")
-    else:
-        snippets.append("No relevant web results found.")
-
-    return "\n".join(snippets)
+# Load Full Note  template from template.md
+with open("brain/template.md", "r") as f:
+    note_template = f.read()
 
 
+#####################################################################################################################################################################
 
+# Take new_note and save it to Google Drive
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+#####################################################################################################################################################################
 
 
 # /start COMMAND
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hey! I'm Qamar, your voice + text assistant. Send me a voice note or type /daily."
+        "Hey! I'm Qamar. I help organise your brain dumps in Obsidian. Tell me your idea in a voice note and I'll remember that for you."
     )
-
-
-
-
-
-# /daily COMMAND
-async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "This is your daily summary. (We’ll hook up GPT and calendar soon)")
-
-
 
 
 
@@ -102,171 +47,72 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await context.bot.get_file(update.message.voice.file_id)
 
-    with tempfile.NamedTemporaryFile(suffix=".ogg") as tmp:
+    # Download user's voice message
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         await file.download_to_drive(custom_path=tmp.name)
         tmp.flush()
 
-        with open(tmp.name, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language="en"
+    # AI listens to user voice message
+    with open(tmp.name, "rb") as audio_file:
+        # Create a transcription of the audio file
+        # To print only the transcription text, you'd use print(transcription.text)
+        transcript = groq_client.audio.transcriptions.create(
+            file=audio_file,                                                                                # Required audio file
+            model=groq_model,                                                                               # Required model to use for transcription
+            prompt="Specify context or spelling",                                                           # Optional
+            response_format="verbose_json",                                                                 # Optional
+            timestamp_granularities = ["word", "segment"],                                                  # Optional (must set response_format to "json" to use and can specify "word", "segment" (default), or both)
+            language="en",                                                                                  # Optional
+            temperature=0.0                                                                                 # Optional
             )
 
-    user_text = transcript.text
-    # DEBUG
-    # await update.message.reply_text(f"You said: {user_text}")
 
-    user_id = str(update.message.from_user.id)
+    # Check for trigger phrase "new idea", and produce MD file
+    if "new idea" in transcript.text.lower():
 
-
-
-
-    
-    # WEB SEARCH
-    search_triggers = ["search", "look up", "google", "find out", "what is", "who is"]
-
-    def is_search_intent(text):
-        text_lower = text.lower()
-        return any(text_lower.startswith(trigger) for trigger in search_triggers)
-
-    if is_search_intent(user_text):
-        # Extract query from text
-        for trigger in search_triggers:
-            if user_text.lower().startswith(trigger):
-                query = user_text[len(trigger):].strip()
-                break
-
-        # Run web search
-        search_results = web_search(query)
-
-        # Build prompt with search results
-        prompt = (
-            f"User wants fresh info on: '{query}'. Here are the latest search snippets:\n"
-            f"{search_results}\n"
-            "Answer casually, directly, and keep it chill like a Gen Z assistant."
+        response = gemini_client.models.generate_content(
+            model=gemini_model,
+            contents=f"Don't reply to the user. Produce only content in a markdown file that contains the new idea shared by the user. Refine the idea where possible. Reuse as much of the user's words as possible in the markdown.\
+            \nThis is the markdown file template that you must strictly follow. For Tags, always write it as '[[tag]]' and it only is one word. Add up to 5 tags.: {note_template}\
+            \nThis is the end of the template. Right now the date and time are {now}. This is the user's idea: {transcript.text}",
+            config=types.GenerateContentConfig(
+                system_instruction=qamar_system_prompt
+            )
         )
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": qamar_system_prompt},
-                {"role": "user", "content": prompt}
-            ]
-        )
+        new_note = response.text
+        reply_text = "New note created in Obsidian."
 
-        reply_text = response.choices[0].message.content
-        # Generate audio file
-        # Generate speech from reply_text using OpenAI TTS
-        speech_response = client.audio.speech.create(
-            model="tts-1",
-            voice=voice,
-            input=reply_text
-        )
-
-
-        
-        # Save audio to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as speech_file:
-            speech_file.write(speech_response.content)
-            speech_path = speech_file.name
-        # Send audio as a voice message
-        with open(speech_path, "rb") as audio:
-            await update.message.reply_voice(voice=audio)
-
-        # Send text as a reply
-        await update.message.reply_text(reply_text)
-
-
-
-    
+    # If no trigger phrase, do nothing
     else:
-        # Normal Qamar flow: Summarization + memory
-        user_id = str(update.message.from_user.id)
-        # Create new highlights container, if don't have yet
-        if user_id not in qamar_memory:
-            qamar_memory[user_id] = {}
-        if "highlights" not in qamar_memory[user_id]:
-            qamar_memory[user_id]["highlights"] = []
-    
-        # STORE IN MEMORY
-        summary_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a smart assistant. Summarize this message as a short, memorable highlight or insight. Don't respond to it:"},
-                {"role": "user", "content": transcript.text}
-            ]
-        )
-    
-        # Extract the summary and store in highlight variable
-        highlight = summary_response.choices[0].message.content.strip()
-    
-        if highlight and highlight not in qamar_memory[user_id]["highlights"]:
-            qamar_memory[user_id]["highlights"].append(highlight)
-            # If highlight is not exact same as past ones, add to memory
-            save_memory(qamar_memory)
+        # response = gemini_client.models.generate_content(
+        #     model=gemini_model,
+        #     contents=f"Respond to this: {transcript.text}",
+        #     config=types.GenerateContentConfig(
+        #         system_instruction=qamar_system_prompt
+        #     )
+        # )
+        # reply_text = response.text
+        reply_text = "No new idea."
+    # Delete user's audio file
+    os.remove(tmp.name)
 
 
 
-
-        
-        # Reduce memory overload whenever recalled
-        MAX_HIGHLIGHTS = 15
-        if len(qamar_memory[user_id]["highlights"]) > MAX_HIGHLIGHTS:
-            qamar_memory[user_id]["highlights"] = qamar_memory[user_id]["highlights"][-MAX_HIGHLIGHTS:]
-            save_memory(qamar_memory)
-    
-        highlights = "\n- ".join(qamar_memory[user_id]["highlights"])
-        memory_context = f"Here are the important things this user has said before:\n- {highlights}"
+    print(f"[DEBUG {now}] User's voice input: {transcript.text}")
+    print(f"\n[DEBUG {now}] New MD file:\n{new_note}\n")
+    print(f"[DEBUG {now}] AI message output: {reply_text}")
+    # Send text as a reply
+    await update.message.reply_text(reply_text)
 
 
-
-
-        
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": qamar_system_prompt},
-                {"role": "user", "content": f"{memory_context}\n\nRespond to this: {transcript.text}"}
-            ]
-        )
-    
-        reply_text = response.choices[0].message.content
-
-
-
-
-        
-        # Generate speech from reply_text using OpenAI TTS
-        speech_response = client.audio.speech.create(
-            model="tts-1",
-            voice=voice,
-            input=reply_text
-        )
-        # Save audio to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as speech_file:
-            speech_file.write(speech_response.content)
-            speech_path = speech_file.name
-        # Send audio as a voice message
-        with open(speech_path, "rb") as audio:
-            await update.message.reply_voice(voice=audio)
-        # Send text as a reply
-        await update.message.reply_text(reply_text)
-
-
-
-
-
-
-
-
+#####################################################################################################################################################################
 
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("daily", daily))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     print("Qamar is live.")
