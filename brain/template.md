@@ -6,6 +6,5 @@ Maturity: baby/teen/adult
 ___
 # {{Title}}
 
-
 # References
 N/A
