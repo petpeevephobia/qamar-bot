@@ -1,7 +1,6 @@
 venv/
 .env
 token.json
-credentials.json
 service_account_key.json
 __pycache__/
 .git/

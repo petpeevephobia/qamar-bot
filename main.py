@@ -4,6 +4,8 @@ import re
 import datetime
 import tempfile
 import threading
+from zoneinfo import ZoneInfo
+TZ = ZoneInfo(os.getenv("QAMAR_TIMEZONE", "Europe/Berlin"))
 
 import uvicorn
 from dotenv import load_dotenv
@@ -173,7 +175,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "- Prefer existing tags whenever they fit; only invent a new tag if none apply.\n"
                 "- For Maturity, always set it as #baby with the hashtag symbol, also in lowercase.\n"
                 "This is the end of the template. "
-                f"Right now the date and time are {now}. This is the user's idea: {transcript.text}"
+                f"Right now the date and time are {datetime.datetime.now(TZ):%d-%m-%Y %H:%M}. This is the user's idea: {transcript.text}"
             ),
             config=types.GenerateContentConfig(system_instruction=qamar_system_prompt),
         )

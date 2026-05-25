@@ -160,5 +160,5 @@ cython_debug/
 #.idea/
 
 service_account_key.json
-credentials.json
 token.json
+credentials.json
