@@ -39,8 +39,47 @@ with open("brain/qamar_role.txt", "r") as f:
 with open("brain/template.md", "r") as f:
     note_template = f.read()
 
+TAGS_FILE = "brain/tags.txt"
+
 
 #####################################################################################################################################################################
+
+
+def load_tags() -> list[str]:
+    if not os.path.exists(TAGS_FILE):
+        return []
+    with open(TAGS_FILE, encoding="utf-8") as f:
+        tags = []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            match = re.match(r"\[\[(.+?)\]\]", line)
+            tag = (match.group(1) if match else line).strip().lower()
+            if tag:
+                tags.append(tag)
+        return sorted(set(tags))
+
+
+def format_tags_for_prompt(tags: list[str]) -> str:
+    if not tags:
+        return "(none yet — create new tags only if needed)"
+    return ", ".join(f"[[{tag}]]" for tag in tags)
+
+
+def extract_tags_from_markdown(markdown: str) -> list[str]:
+    return sorted({t.strip().lower() for t in re.findall(r"\[\[([^\]]+)\]\]", markdown) if t.strip()})
+
+
+def append_new_tags(used_tags: list[str]) -> list[str]:
+    existing = set(load_tags())
+    new_tags = sorted({t.lower().strip() for t in used_tags if t.lower().strip()} - existing)
+    if not new_tags:
+        return []
+    with open(TAGS_FILE, "a" if existing else "w", encoding="utf-8") as f:
+        for tag in new_tags:
+            f.write(f"{tag}\n")
+    return new_tags
 
 
 # Ensure file name saved in Drive is of the correct format and causes no conflict
@@ -119,16 +158,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Generate MD file
     if "new idea" in transcript.text.lower():
+        existing_tags = load_tags()
         response = gemini_client.models.generate_content(
             model=gemini_model,
             contents=(
                 "Don't reply to the user. Produce only content in a markdown file that contains "
                 "the new idea shared by the user. Refine the idea where possible. Reuse as much of "
                 "the user's words as possible in the markdown.\n"
-                f"This is the markdown file template that you must strictly follow. For Tags, "
-                "always write it as '[[tag]]' and it's only one word, all in lowercase. Add up to "
-                f"5 tags. For Maturity, always set it as #baby with the hashtag symbol, also in "
-                f"lowercase.: {note_template}\n"
+                f"This is the markdown file template that you must strictly follow: {note_template}\n"
+                "Tag rules:\n"
+                f"- Existing tags in the vault (reuse the most appropriate ones first, but create new ones only if needed): "
+                f"{format_tags_for_prompt(existing_tags)}\n"
+                "- Always write tags as [[tag]], one word each, all lowercase, up to 5 tags.\n"
+                "- Prefer existing tags whenever they fit; only invent a new tag if none apply.\n"
+                "- For Maturity, always set it as #baby with the hashtag symbol, also in lowercase.\n"
                 "This is the end of the template. "
                 f"Right now the date and time are {now}. This is the user's idea: {transcript.text}"
             ),
@@ -136,6 +179,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         new_note = response.text
+        new_tags = append_new_tags(extract_tags_from_markdown(new_note))
+        if new_tags:
+            print(f"[DEBUG {now}] New tags added to {TAGS_FILE}: {', '.join(new_tags)}")
         try:
             filename = note_filename_from_markdown(new_note)
             saved_name = save_note_to_drive(get_drive_service(), new_note, filename)
@@ -158,7 +204,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if new_note:
         print(f"\n[DEBUG {now}] New MD file:\n{new_note}\n")
     print(f"[DEBUG {now}] AI message output: {reply_text}")
-    
+
     await update.message.reply_text(reply_text)
 
 
