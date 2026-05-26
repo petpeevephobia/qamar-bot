@@ -25,11 +25,7 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 from groq import Groq
-from googleapiclient.errors import HttpError
-
 from drive_client import (
-    DriveAuthRequiredError,
-    build_reauth_url,
     delete_note_by_id,
     download_note_content,
     get_drive_service,
@@ -38,6 +34,7 @@ from drive_client import (
     save_note_to_drive,
 )
 from oauth_app import app as fastapi_app
+from user_errors import drive_reauth_message, format_user_error
 
 now = datetime.datetime.now()
 
@@ -146,14 +143,6 @@ def format_drive_created_time(created_time_rfc3339: str) -> str:
     return dt.astimezone(TZ).strftime("%d-%m-%Y %H:%M")
 
 
-def drive_auth_reply() -> str:
-    try:
-        url = build_reauth_url()
-    except ValueError:
-        return "Drive login expired. Set OAUTH_LINK_SECRET in .env and restart the bot."
-    return f"Drive login expired. Reconnect here:\n{url}"
-
-
 def run_http_server():
     uvicorn.run(
         fastapi_app,
@@ -179,14 +168,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # /reauth
 async def reauth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        url = build_reauth_url()
-    except ValueError:
-        await update.message.reply_text(
-            "OAUTH_LINK_SECRET is not configured. Add it to .env and restart the bot."
-        )
-        return
-    await update.message.reply_text(f"Reconnect Google Drive:\n{url}")
+    await update.message.reply_text(drive_reauth_message())
 
 
 # /delete
@@ -219,11 +201,9 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Delete this file from Drive?",
             reply_markup=keyboard,
         )
-    except DriveAuthRequiredError:
-        await update.message.reply_text(drive_auth_reply())
-    except (HttpError, ValueError) as e:
+    except Exception as e:
         print(f"[ERROR {now}] Drive lookup failed: {e}")
-        await update.message.reply_text("Could not find the note. Check the bot logs.")
+        await update.message.reply_text(format_user_error(e, context="drive_lookup"))
 
 
 # Deleting process
@@ -261,83 +241,95 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_text += f"\nRemoved unused tags: {', '.join(removed_tags)}"
             print(f"[DEBUG {now}] Tags removed from {TAGS_FILE}: {', '.join(removed_tags)}")
         await query.edit_message_text(reply_text)
-    except DriveAuthRequiredError:
-        await query.edit_message_text(drive_auth_reply())
-    except (HttpError, ValueError) as e:
+    except Exception as e:
         print(f"[ERROR {now}] Drive delete failed: {e}")
-        await query.edit_message_text("Could not delete the note. Check the bot logs.")
+        await query.edit_message_text(format_user_error(e, context="drive_delete"))
 
 
 # WHEN USER SENDS A VOICE MESSAGE
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = await context.bot.get_file(update.message.voice.file_id)
+    tmp_path: str | None = None
+    reply_text: str
+    new_note: str | None = None
+    transcript_text: str | None = None
 
-    # Download the audio file
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        await file.download_to_drive(custom_path=tmp.name)
-        tmp.flush()
+    try:
+        file = await context.bot.get_file(update.message.voice.file_id)
 
-    # Groq transcribes user's audio file
-    with open(tmp.name, "rb") as audio_file:
-        transcript = groq_client.audio.transcriptions.create(
-            file=audio_file,
-            model=groq_model,
-            prompt="Specify context or spelling",
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
-            language="en",
-            temperature=0.0,
-        )
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+            await file.download_to_drive(custom_path=tmp_path)
+            tmp.flush()
 
-    # Generate MD file
-    if "new idea" in transcript.text.lower():
-        existing_tags = load_tags()
-        response = gemini_client.models.generate_content(
-            model=gemini_model,
-            contents=(
-                "Don't reply to the user. Produce only content in a markdown file that contains the new idea shared by the user. Refine the idea while reusing the user's words in the markdown.\n"
-                f"This is the markdown file template that you must strictly follow: {note_template}\n"
-                "Tag rules:\n"
-                f"- Existing tags in the vault (reuse the most appropriate ones first, but create new ones only if needed): "
-                f"{format_tags_for_prompt(existing_tags)}\n"
-                "- Always write tags as [[tag]], one word each, all lowercase, up to 5 tags.\n"
-                "- Prefer existing tags whenever they fit; only invent a new tag if none apply.\n"
-                "- For Maturity, always set it as #baby with the hashtag symbol, also in lowercase.\n"
-                "This is the end of the template. "
-                f"Right now the date and time are {datetime.datetime.now(TZ):%d-%m-%Y %H:%M}. This is the user's idea: {transcript.text}"
-            ),
-            config=types.GenerateContentConfig(system_instruction=qamar_system_prompt),
-        )
-
-        new_note = response.text
-        # Save newly created tags to tags.txt for future reference
-        new_tags = append_new_tags(extract_tags_from_markdown(new_note))
-        if new_tags:
-            print(f"[DEBUG {now}] New tags added to {TAGS_FILE}: {', '.join(new_tags)}")
         try:
-            filename = note_filename_from_markdown(new_note)
-            saved_name = save_note_to_drive(get_drive_service(), new_note, filename)
-            reply_text = f"New note saved to Drive: {saved_name}"
-        except DriveAuthRequiredError:
-            reply_text = drive_auth_reply()
-        except (HttpError, ValueError) as e:
-            print(f"[ERROR {now}] Drive upload failed: {e}")
-            reply_text = "New idea captured, but saving to Drive failed. Check the bot logs."
-    
-    
-    # If user's input does NOT contain "new idea" (trigger)
-    else:
-        reply_text = "No new idea."
-        new_note = None
+            with open(tmp_path, "rb") as audio_file:
+                transcript = groq_client.audio.transcriptions.create(
+                    file=audio_file,
+                    model=groq_model,
+                    prompt="Specify context or spelling",
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                    language="en",
+                    temperature=0.0,
+                )
+        except Exception as e:
+            print(f"[ERROR {now}] Groq transcription failed: {e}")
+            await update.message.reply_text(format_user_error(e, context="groq"))
+            return
 
-    os.remove(tmp.name)
+        transcript_text = transcript.text
 
-    print(f"[DEBUG {now}] User's voice input: {transcript.text}")
-    if new_note:
-        print(f"\n[DEBUG {now}] New MD file:\n{new_note}\n")
-    print(f"[DEBUG {now}] AI message output: {reply_text}")
+        if "new idea" in transcript_text.lower():
+            existing_tags = load_tags()
+            try:
+                response = gemini_client.models.generate_content(
+                    model=gemini_model,
+                    contents=(
+                        "Don't reply to the user. Produce only content in a markdown file that contains the new idea shared by the user. Refine the idea while reusing the user's words in the markdown.\n"
+                        f"This is the markdown file template that you must strictly follow: {note_template}\n"
+                        "Tag rules:\n"
+                        f"- Existing tags in the vault (reuse the most appropriate ones first, but create new ones only if needed): "
+                        f"{format_tags_for_prompt(existing_tags)}\n"
+                        "- Always write tags as [[tag]], one word each, all lowercase, up to 5 tags.\n"
+                        "- Prefer existing tags whenever they fit; only invent a new tag if none apply.\n"
+                        "- For Maturity, always set it as #baby with the hashtag symbol, also in lowercase.\n"
+                        "This is the end of the template. "
+                        f"Right now the date and time are {datetime.datetime.now(TZ):%d-%m-%Y %H:%M}. This is the user's idea: {transcript_text}"
+                    ),
+                    config=types.GenerateContentConfig(system_instruction=qamar_system_prompt),
+                )
+            except Exception as e:
+                print(f"[ERROR {now}] Gemini note generation failed: {e}")
+                await update.message.reply_text(format_user_error(e, context="gemini"))
+                return
 
-    await update.message.reply_text(reply_text)
+            new_note = response.text
+            new_tags = append_new_tags(extract_tags_from_markdown(new_note))
+            if new_tags:
+                print(f"[DEBUG {now}] New tags added to {TAGS_FILE}: {', '.join(new_tags)}")
+            try:
+                filename = note_filename_from_markdown(new_note)
+                saved_name = save_note_to_drive(get_drive_service(), new_note, filename)
+                reply_text = f"New note saved to Drive: {saved_name}"
+            except Exception as e:
+                print(f"[ERROR {now}] Drive upload failed: {e}")
+                reply_text = format_user_error(e, context="drive_upload")
+        else:
+            reply_text = "No new idea."
+
+        print(f"[DEBUG {now}] User's voice input: {transcript_text}")
+        if new_note:
+            print(f"\n[DEBUG {now}] New MD file:\n{new_note}\n")
+        print(f"[DEBUG {now}] AI message output: {reply_text}")
+        await update.message.reply_text(reply_text)
+
+    except Exception as e:
+        print(f"[ERROR {now}] Voice handler failed: {e}")
+        await update.message.reply_text(format_user_error(e, context="groq"))
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 #####################################################################################################################################################################

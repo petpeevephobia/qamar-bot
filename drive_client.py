@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import time
 from dotenv import load_dotenv
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -21,6 +22,26 @@ OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
 
 _drive_service = None
 
+_DEBUG_LOG_PATH = "debug-5b8722.log"
+
+
+def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "5b8722",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
 
 class DriveAuthRequiredError(Exception):
     """Raised when Google Drive needs a new OAuth login."""
@@ -38,13 +59,101 @@ def build_reauth_url() -> str:
     return f"{base}/oauth/start?secret={secret}"
 
 
+def _parse_token_json_string(raw: str) -> tuple[dict, str]:
+    """Parse OAuth token JSON from env; tolerate common Fly/shell quoting mistakes."""
+    raw = raw.strip().lstrip("\ufeff")
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        raw = raw[1:-1].strip()
+
+    candidates: list[tuple[str, str]] = [("direct", raw)]
+    if raw.startswith("{{") and raw.endswith("}}"):
+        candidates.append(("strip_double_brace", raw[1:-1]))
+    if raw.startswith("{{"):
+        candidates.append(("strip_leading_brace", raw[1:]))
+
+    last_error: json.JSONDecodeError | None = None
+    for method, candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as e:
+            last_error = e
+            continue
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except json.JSONDecodeError as e:
+                last_error = e
+                continue
+        if isinstance(parsed, dict):
+            return parsed, method
+    if last_error:
+        raise last_error
+    raise json.JSONDecodeError("Invalid OAuth token JSON", raw, 0)
+
+
 def _load_token_data() -> dict | None:
     env_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON")
+    # #region agent log
+    _agent_debug_log(
+        "E",
+        "drive_client.py:_load_token_data",
+        "token source check",
+        {
+            "has_env_json": bool(env_json),
+            "env_json_len": len(env_json) if env_json else 0,
+            "env_starts_with_brace": env_json.strip().startswith("{") if env_json else False,
+            "env_starts_with_double_brace": env_json.strip().startswith("{{") if env_json else False,
+            "env_has_single_quotes": "'" in env_json if env_json else False,
+            "token_file_exists": os.path.exists(GOOGLE_OAUTH_TOKEN),
+            "token_file_path": GOOGLE_OAUTH_TOKEN,
+        },
+    )
+    # #endregion
     if env_json:
-        return json.loads(env_json)
+        try:
+            parsed, parse_method = _parse_token_json_string(env_json)
+            # #region agent log
+            _agent_debug_log(
+                "E",
+                "drive_client.py:_load_token_data",
+                "env json parsed ok",
+                {
+                    "parse_method": parse_method,
+                    "keys": sorted(parsed.keys()) if isinstance(parsed, dict) else "not_dict",
+                },
+            )
+            # #endregion
+            return parsed
+        except json.JSONDecodeError as e:
+            # #region agent log
+            _agent_debug_log(
+                "E",
+                "drive_client.py:_load_token_data",
+                "env json parse failed",
+                {
+                    "error": str(e),
+                    "error_pos": e.pos,
+                    "env_json_len": len(env_json),
+                    "prefix_ord": [ord(c) for c in env_json.strip()[:4]],
+                },
+            )
+            # #endregion
+            raise
     if os.path.exists(GOOGLE_OAUTH_TOKEN):
         with open(GOOGLE_OAUTH_TOKEN, encoding="utf-8") as f:
-            return json.load(f)
+            file_data = json.load(f)
+        # #region agent log
+        _agent_debug_log(
+            "F",
+            "drive_client.py:_load_token_data",
+            "token loaded from file",
+            {"keys": sorted(file_data.keys()) if isinstance(file_data, dict) else "not_dict"},
+        )
+        # #endregion
+        return file_data
+    # #region agent log
+    _agent_debug_log("G", "drive_client.py:_load_token_data", "no token source found", {})
+    # #endregion
     return None
 
 
@@ -73,24 +182,57 @@ def create_oauth_flow() -> Flow:
 
 
 def get_drive_credentials() -> Credentials:
-    token_data = _load_token_data()
+    try:
+        token_data = _load_token_data()
+    except json.JSONDecodeError:
+        # #region agent log
+        _agent_debug_log(
+            "E",
+            "drive_client.py:get_drive_credentials",
+            "re-raising JSONDecodeError from token load",
+            {},
+        )
+        # #endregion
+        raise
     creds = None
     if token_data:
         creds = Credentials.from_authorized_user_info(token_data, DRIVE_SCOPES)
 
     if creds and creds.valid:
+        # #region agent log
+        _agent_debug_log("H", "drive_client.py:get_drive_credentials", "credentials valid", {})
+        # #endregion
         return creds
 
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
             save_credentials(creds)
+            # #region agent log
+            _agent_debug_log("H", "drive_client.py:get_drive_credentials", "credentials refreshed", {})
+            # #endregion
             return creds
         except RefreshError as e:
+            # #region agent log
+            _agent_debug_log(
+                "H",
+                "drive_client.py:get_drive_credentials",
+                "refresh failed",
+                {"error": type(e).__name__},
+            )
+            # #endregion
             raise DriveAuthRequiredError(
                 "Google Drive refresh token expired or revoked."
             ) from e
 
+    # #region agent log
+    _agent_debug_log(
+        "G",
+        "drive_client.py:get_drive_credentials",
+        "no valid credentials",
+        {"had_token_data": bool(token_data), "creds_created": creds is not None},
+    )
+    # #endregion
     raise DriveAuthRequiredError("No valid Google Drive token. Re-authorize to continue.")
 
 
@@ -102,7 +244,21 @@ def invalidate_drive_service() -> None:
 def get_drive_service():
     global _drive_service
     if _drive_service is None:
-        _drive_service = build("drive", "v3", credentials=get_drive_credentials())
+        try:
+            _drive_service = build("drive", "v3", credentials=get_drive_credentials())
+            # #region agent log
+            _agent_debug_log("H", "drive_client.py:get_drive_service", "drive service built", {})
+            # #endregion
+        except Exception as e:
+            # #region agent log
+            _agent_debug_log(
+                "E",
+                "drive_client.py:get_drive_service",
+                "drive service build failed",
+                {"error_type": type(e).__name__, "error": str(e)},
+            )
+            # #endregion
+            raise
     return _drive_service
 
 

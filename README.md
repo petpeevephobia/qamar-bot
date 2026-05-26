@@ -58,7 +58,13 @@ Qamar receives voice messages on Telegram, transcribes them, and turns spoken id
 
 When Drive auth expires, the bot replies with a reconnect link or use `/reauth`.
 
-**Fly secrets:** set `BASE_URL`, `OAUTH_REDIRECT_URI`, `OAUTH_LINK_SECRET`, and optionally `GOOGLE_OAUTH_TOKEN_JSON` after first auth.
+**Fly secrets:** set `BASE_URL`, `OAUTH_REDIRECT_URI`, `OAUTH_LINK_SECRET`, and after first auth set the Drive token from file (avoids broken escaping):
+
+```bash
+fly secrets set GOOGLE_OAUTH_TOKEN_JSON=@token.json -a qamar-bot
+```
+
+Use a single `{` at the start of the JSON — `{{...}}` will break parsing. Re-run `/reauth` on Fly if uploads still fail after updating the secret.
 
 ## On the horizon
 

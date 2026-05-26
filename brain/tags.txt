@@ -8,3 +8,5 @@ governance
 politicaltheory
 project
 rousseau
+animalcommunication
+futuretech
