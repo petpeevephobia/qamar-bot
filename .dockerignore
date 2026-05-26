@@ -4,3 +4,4 @@ token.json
 service_account_key.json
 __pycache__/
 .git/
+README.md
