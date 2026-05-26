@@ -6,7 +6,8 @@ from typing import Literal
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
-from drive_client import DriveAuthRequiredError, build_reauth_url
+from modules.drive_client import DriveAuthRequiredError, build_reauth_url
+from modules.rate_limit_notify import format_reset_countdown
 
 Context = Literal[
     "groq",
@@ -42,7 +43,7 @@ def _http_status(exc: BaseException) -> int | None:
     return None
 
 
-def _is_rate_limit(exc: BaseException) -> bool:
+def is_rate_limit(exc: BaseException) -> bool:
     status = _http_status(exc)
     if status == 429:
         return True
@@ -152,8 +153,11 @@ def format_user_error(exc: BaseException, *, context: Context) -> str:
                 )
             return drive_reauth_message()
 
-    if _is_rate_limit(exc):
-        return _rate_limit_message(context)
+    if is_rate_limit(exc):
+        msg = _rate_limit_message(context)
+        if context in ("groq", "gemini"):
+            msg += f"\n\nResets in {format_reset_countdown()} (midnight Pacific)."
+        return msg
 
     if isinstance(exc, ValueError) and context.startswith("drive"):
         msg = str(exc).lower()

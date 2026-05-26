@@ -4,7 +4,7 @@ import os
 
 from dotenv import load_dotenv
 
-from drive_client import build_reauth_url
+from modules.drive_client import build_reauth_url
 
 load_dotenv()
 

@@ -25,7 +25,7 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 from groq import Groq
-from drive_client import (
+from modules.drive_client import (
     delete_note_by_id,
     download_note_content,
     get_drive_service,
@@ -33,8 +33,9 @@ from drive_client import (
     list_vault_notes,
     save_note_to_drive,
 )
-from oauth_app import app as fastapi_app
-from user_errors import drive_reauth_message, format_user_error
+from modules.oauth_app import app as fastapi_app
+from modules.rate_limit_notify import PACIFIC, mark_rate_limited, send_midnight_reset_notifications
+from modules.user_errors import drive_reauth_message, format_user_error, is_rate_limit
 
 now = datetime.datetime.now()
 
@@ -274,6 +275,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             print(f"[ERROR {now}] Groq transcription failed: {e}")
+            if is_rate_limit(e) and update.effective_user:
+                mark_rate_limited(update.effective_user.id, "groq")
             await update.message.reply_text(format_user_error(e, context="groq"))
             return
 
@@ -293,6 +296,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "- Always write tags as [[tag]], one word each, all lowercase, up to 5 tags.\n"
                         "- Prefer existing tags whenever they fit; only invent a new tag if none apply.\n"
                         "- For Maturity, always set it as #baby with the hashtag symbol, also in lowercase.\n"
+                        "- Don't add commas between each tag. Just use space to tell them apart.\n"
                         "This is the end of the template. "
                         f"Right now the date and time are {datetime.datetime.now(TZ):%d-%m-%Y %H:%M}. This is the user's idea: {transcript_text}"
                     ),
@@ -300,6 +304,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 print(f"[ERROR {now}] Gemini note generation failed: {e}")
+                if is_rate_limit(e) and update.effective_user:
+                    mark_rate_limited(update.effective_user.id, "gemini")
                 await update.message.reply_text(format_user_error(e, context="gemini"))
                 return
 
@@ -335,10 +341,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #####################################################################################################################################################################
 
 
+async def midnight_rate_limit_job(context: ContextTypes.DEFAULT_TYPE):
+    await send_midnight_reset_notifications(context.bot)
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_http_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    if app.job_queue is None:
+        print("[WARN] JobQueue unavailable — install python-telegram-bot[job-queue]")
+    else:
+        app.job_queue.run_daily(
+            midnight_rate_limit_job,
+            time=datetime.time(0, 0, tzinfo=PACIFIC),
+            name="pacific_midnight_rate_limit_reset",
+        )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reauth", reauth))
     app.add_handler(CommandHandler("delete", delete))

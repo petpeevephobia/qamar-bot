@@ -41,6 +41,12 @@ Qamar receives voice messages on Telegram, transcribes them, and turns spoken id
 - **Cancel** — aborts without deleting.
 - Debug logs record when a delete is requested, confirmed, or rejected.
 
+### Groq / Gemini rate limits
+
+- If **Groq** or **Gemini** hits a daily rate limit, the bot replies with the usual message plus **how long until midnight Pacific** when limits reset (e.g. `Resets in 9h 42m (midnight Pacific).`).
+- If you were limited that Pacific calendar day, Qamar sends a **midnight Pacific** DM when the day rolls over: limits have reset and you can send voice notes again.
+- Flags are stored in `brain/rate_limit_notify.json` (same persistence caveats as `tags.txt` on Fly).
+
 ### Google Drive auth
 
 - A small **OAuth web app** (FastAPI on port `8080`) handles Drive login and token refresh. If auth fails during upload or delete, Qamar replies with a reconnect URL (same flow as `/reauth`).
@@ -54,7 +60,7 @@ Qamar receives voice messages on Telegram, transcribes them, and turns spoken id
    - Fly: `https://qamar-bot.fly.dev/oauth/callback`
 4. Download JSON as `credentials.json` in the project root.
 5. In `.env`: set `GOOGLE_DRIVE_FOLDER_ID`, `OAUTH_LINK_SECRET` (random string), `BASE_URL`, `OAUTH_REDIRECT_URI`.
-6. Run `python main.py`, then open the URL from `python authorize_drive.py` (or send `/reauth` in Telegram).
+6. Run `python main.py`, then open the URL from `python -m modules.authorize_drive` (or send `/reauth` in Telegram).
 
 When Drive auth expires, the bot replies with a reconnect link or use `/reauth`.
 
@@ -69,5 +75,4 @@ Use a single `{` at the start of the JSON — `{{...}}` will break parsing. Re-r
 ## On the horizon
 
 - RAG over existing Obsidian notes to help ideate on new projects (problem statements, SWOT, stack-aware suggestions for Python, TypeScript, Go, SQL)
-- Error message to the user in quote for Gemini or Groq Whisper exceeds for the day
 - Sync exisiting tags in Obsidian to  tags in `tags.txt` so Qamar is always aware of tags that may be manually added or deleted
