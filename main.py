@@ -192,14 +192,17 @@ async def reauth(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /delete
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Select most recent note
         note = get_most_recent_note(get_drive_service())
+        # If no notes at all
         if note is None:
             await update.message.reply_text("No notes found in Drive to delete.")
             return
-
+        # Get note information
         context.user_data["pending_delete_id"] = note["id"]
         context.user_data["pending_delete_name"] = note["name"]
         created = format_drive_created_time(note["createdTime"])
+        # Button UI on Telegram: Yes, delete / Cancel
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -223,6 +226,7 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Could not find the note. Check the bot logs.")
 
 
+# Deleting process
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -246,11 +250,11 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[DEBUG {now}] Delete confirmed: {file_name or file_id}")
     try:
         drive = get_drive_service()
-        deleted_content = download_note_content(drive, file_id)
-        deleted_tags = extract_tags_from_markdown(deleted_content)
-        tags_in_other_notes = collect_tags_in_vault(drive, exclude_id=file_id)
-        removed_tags = prune_orphan_tags(deleted_tags, tags_in_other_notes)
-        deleted_name = delete_note_by_id(drive, file_id)
+        deleted_content = download_note_content(drive, file_id)                     # Read content of file to be deleted
+        deleted_tags = extract_tags_from_markdown(deleted_content)                  # Get the tags in the file
+        tags_in_other_notes = collect_tags_in_vault(drive, exclude_id=file_id)      # Look at other tags in the vault
+        removed_tags = prune_orphan_tags(deleted_tags, tags_in_other_notes)         # Delete tags that are only attached to the file to be deleted
+        deleted_name = delete_note_by_id(drive, file_id)                            # Confirm deletion
 
         reply_text = f"Deleted from Drive: {deleted_name}"
         if removed_tags:
@@ -306,6 +310,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         new_note = response.text
+        # Save newly created tags to tags.txt for future reference
         new_tags = append_new_tags(extract_tags_from_markdown(new_note))
         if new_tags:
             print(f"[DEBUG {now}] New tags added to {TAGS_FILE}: {', '.join(new_tags)}")
