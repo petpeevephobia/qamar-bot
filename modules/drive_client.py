@@ -53,6 +53,7 @@ class DriveAuthRequiredError(Exception):
 
 def build_reauth_url() -> str:
     base = os.getenv("BASE_URL", "http://localhost:8080").rstrip("/")
+    # base = os.getenv("BASE_URL", "https://qamar-bot.fly.dev").rstrip("/")
     secret = os.getenv("OAUTH_LINK_SECRET", "")
     if not secret:
         raise ValueError("OAUTH_LINK_SECRET must be set in .env")
@@ -315,7 +316,7 @@ def list_vault_notes(drive_service) -> list[dict]:
             drive_service.files()
             .list(
                 q=_vault_md_query(),
-                fields="nextPageToken, files(id, name)",
+                fields="nextPageToken, files(id, name, createdTime)",
                 pageSize=100,
                 pageToken=page_token,
             )

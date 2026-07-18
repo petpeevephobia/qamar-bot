@@ -4,6 +4,8 @@ import re
 import datetime
 import tempfile
 import threading
+import random
+from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
 TZ = ZoneInfo(os.getenv("QAMAR_TIMEZONE", "Europe/Berlin"))
 
@@ -144,6 +146,35 @@ def format_drive_created_time(created_time_rfc3339: str) -> str:
     return dt.astimezone(TZ).strftime("%d-%m-%Y %H:%M")
 
 
+
+# Fetch a single note's content and extract its tags
+def fetch_single_note_metadata(drive_service, note: dict) -> dict | None:
+    try:
+        content = download_note_content(drive_service, note["id"])
+        tags = extract_tags_from_markdown(content)
+        return {
+            "id": note["id"],
+            "name": note["name"],
+            "createdTime": note.get("createdTime", ""),
+            "content": content,
+            "tags": tags
+        }
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch content for note {note.get('name')}: {e}")
+        return None
+
+
+
+# Download note contents (in parallel to avoid slow sequential APIs)
+def get_all_vault_notes_concurrently(drive_service) -> list[dict]:
+    all_notes = list_vault_notes(drive_service)
+    # 10 worker heads -> pull note metadata very fast
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(lambda n: fetch_single_note_metadata(drive_service, n), all_notes))
+    return [r for r in results if r is not None]
+
+
+
 def run_http_server():
     uvicorn.run(
         fastapi_app,
@@ -247,6 +278,195 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(format_user_error(e, context="drive_delete"))
 
 
+
+# /draft: convert a note to an IG carousel post
+async def draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Book Review", callback_data="draft_type:book"),
+                InlineKeyboardButton("Burning Thought", callback_data="draft_type:thought"),
+            ],
+            [
+                InlineKeyboardButton("Cancel", callback_data="draft_cancel")
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        "what type of ig carousel post are we drafting?",
+        reply_markup=keyboard
+    )
+
+
+
+# /draft process after selecting postt ype/note refresh
+async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    # if user cancels
+    if data == "draft_cancel":
+        context.user_data.pop("draft_state", None)
+        context.user_data.pop("suggested_notes", None)
+        context.user_data.pop("draft_post_type", None)
+        await query.edit_message_text("drafting cancelled")
+        return
+    
+    # if user chose "book" or "thought" (refreshed)
+    if data.startswith("draft_type:") or data.startswith("draft_refresh:"):
+        post_type = data.split(":")[1]          # "book" or "thought"
+
+        await query.edit_message_text("scanning vault and picking 3 random notes ... gimme a sec")
+
+        try:
+            drive_service = get_drive_service()
+            all_notes = get_all_vault_notes_concurrently(drive_service)
+
+            # only get ntoes with [[book]] tag
+            matching_notes = []
+            for note in all_notes:
+                is_book = "book" in note["tags"]
+                if (post_type == "book" and is_book) or (post_type == "thought" and not is_book):
+                    matching_notes.append(note)
+
+            if not matching_notes:
+                await query.edit_message_text(
+                    f"no notes found matching the '{'book' if post_type == 'book' else 'burning thought'}' type"
+                )
+                return
+
+            # show 3 random  notes
+            chosen_sample = random.sample(matching_notes, min(3, len(matching_notes)))
+            # sort notes in descending order by creation date (latest first)
+            chosen_sample.sort(key=lambda x: x["createdTime"], reverse=True)
+
+            # store selection in user context state
+            context.user_data["suggested_notes"] = chosen_sample
+            context.user_data["draft_post_type"] = post_type
+            context.user_data["draft_state"] = "awaiting_selection"
+
+            # Format output message
+            post_label = "book review" if post_type == "book" else "burning thought"
+            msg_text = f"here are 3 random {post_label} suggestions, sorted latest first:\n\n"
+
+            for idx, note in enumerate(chosen_sample, start=1):
+                created = format_drive_created_time(note["createdTime"])
+                msg_text += f"{idx}. {note['name']} (created: {created})\n"
+
+            msg_text += "\nuse the buttons below to act."
+
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Refresh suggestions", callback_data=f"draft_refresh:{post_type}")],
+                    [InlineKeyboardButton("Cancel", callback_data="draft_cancel")],
+                ]
+            )
+
+            await query.edit_message_text(msg_text, reply_markup=keyboard)
+
+        except Exception as e:
+            print(f"[ERROR] Note categorisation failed: {e}")
+            await query.edit_message_text(format_user_error(e, context="drive_lookup"))
+
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Captures manual numerical replies when choosing a note."""
+    state = context.user_data.get("draft_state")
+    if state == "awaiting_selection":
+        text = update.message.text.strip()
+        if text in ("1", "2", "3"):
+            idx = int(text) - 1
+            suggested = context.user_data.get("suggested_notes", [])
+            
+            if idx < len(suggested):
+                selected_note = suggested[idx]
+                post_type = context.user_data.get("draft_post_type")
+
+                # Clear state immediately so subsequent texts aren't captured
+                context.user_data.pop("draft_state", None)
+                context.user_data.pop("suggested_notes", None)
+                context.user_data.pop("draft_post_type", None)
+
+                await generate_carousel_draft(update, context, selected_note, post_type)
+            else:
+                await update.message.reply_text("invalid selection. that option isn't on the list.")
+        else:
+            await update.message.reply_text("type 1, 2, or 3 to pick a note. or cancel using the inline buttons.")
+
+
+
+async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_TYPE, selected_note: dict, post_type: str):
+    # Generates and splits the lowercase carousel draft using Gemini.
+    await update.message.reply_text(f"drafting slides for '{selected_note['name']}'... ✍️")
+
+    try:
+        # Prompt setups tailored to the post type
+        if post_type == "book":
+            framework = (
+                "Format of the book review slides:\n"
+                "Slide 1: <book title> by <author>\n"
+                "Slide 2: Summary of the book in my own words (rely on content within the note)\n"
+                "Slide 3: Opinion and feelings about the book\n"
+                "Slide 4: Would I read it again?\n"
+            )
+        else:
+            framework = (
+                "Format of the burning thought slides:\n"
+                "Slide 1: Hook\n"
+                "Slide 2: Inspiration or context on how this thought came to be\n"
+                "Slide 3: Explain the thought clearly in simple, casual terms\n"
+                "Slide 4: Next course of action while knowing this thought\n"
+                "Slide 5: Close with an ambiguous statement to provoke thinking\n"
+            )
+
+        instructions = (
+            f"{framework}\n"
+            "CRITICAL CONSTRAINTS:\n"
+            "- Write EVERYTHING in lowercase. Absolutely do not use uppercase letters at all.\n"
+            "- Write exactly in the speaking/writing style of the note itself (casual, easygoing, nonchalant, authentic).\n"
+            "- Do not use ANY text formatting. No asterisks (*), no bold, no headers.\n"
+            "- Do not include headers, slide numbers, or slide labels (e.g., do not output 'slide 1:' or 'hook:'). Only write the pure content of each slide.\n"
+            "- Separate each slide's content using a line with exactly three hyphens: '---'."
+        )
+
+        full_system_prompt = qamar_system_prompt + "\n\n" + instructions
+
+        response = gemini_client.models.generate_content(
+            model=gemini_model,
+            contents=(
+                f"Here is the Obsidian note content:\n\n{selected_note['content']}\n\n"
+                "Draft the carousel slides now following the layout and constraints perfectly."
+            ),
+            config=types.GenerateContentConfig(system_instruction=full_system_prompt),
+        )
+
+        output = response.text
+        # Split slides by the '---' separator
+        slides = [slide.strip() for slide in output.split("---") if slide.strip()]
+
+        if not slides:
+            await update.message.reply_text("could not generate any slides. try again.")
+            return
+
+        # Send each slide as a standalone Telegram message
+        for slide in slides:
+            await update.message.reply_text(slide)
+
+    except Exception as e:
+        print(f"[ERROR] Carousel generation failed: {e}")
+        if is_rate_limit(e) and update.effective_user:
+            mark_rate_limited(update.effective_user.id, "gemini")
+        await update.message.reply_text(format_user_error(e, context="gemini"))
+
+        
+
+
+
+
+
 # WHEN USER SENDS A VOICE MESSAGE
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tmp_path: str | None = None
@@ -345,6 +565,25 @@ async def midnight_rate_limit_job(context: ContextTypes.DEFAULT_TYPE):
     await send_midnight_reset_notifications(context.bot)
 
 
+
+async def debug_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Temporary debug handler that prints any button click to the console."""
+    query = update.callback_query
+    # Acknowledge the click immediately so the loading spinner stops
+    await query.answer()
+    
+    # Print the exact incoming data to your terminal/logs
+    print(f"\n[DEBUG] A button was pressed!")
+    print(f"-> Callback Data received: '{query.data}'")
+    print(f"-> User who clicked: {update.effective_user.username} (ID: {update.effective_user.id})\n")
+    
+    # Send a quick text back to the user to confirm it works
+    await query.message.reply_text(f"debug: caught button press with data -> {query.data}")
+
+
+
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_http_server, daemon=True).start()
 
@@ -357,13 +596,29 @@ if __name__ == "__main__":
             time=datetime.time(0, 0, tzinfo=PACIFIC),
             name="pacific_midnight_rate_limit_reset",
         )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reauth", reauth))
     app.add_handler(CommandHandler("delete", delete))
+    app.add_handler(CommandHandler("draft", draft))
+    
+    # Handles delete confirmation/cancellation buttons
     app.add_handler(
         CallbackQueryHandler(delete_callback, pattern=f"^({DELETE_CONFIRM}|{DELETE_CANCEL})$")
     )
+    
+    # Handles the /draft post type selection, refresh, and cancel buttons
+    app.add_handler(
+        CallbackQueryHandler(
+            draft_callback, 
+            pattern=r"^(draft_type:|draft_refresh:|draft_cancel)"
+        )
+    )
+    
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    # Handles text inputs (1, 2, or 3) for choosing suggested notes
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print(f"Qamar is live (OAuth server on port {HTTP_PORT}).")
     app.run_polling()

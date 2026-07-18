@@ -28,7 +28,7 @@ def drive_reauth_message() -> str:
         )
     return (
         "Google Drive is not connected or your login expired.\n"
-        f"Open this link to sign in again:\n{url}\n\n"
+        f"Open this link to sign in again:\n\n{url}\n\n"
         "Or send /reauth in this chat for the same link."
     )
 
