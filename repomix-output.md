@@ -189,6 +189,345 @@ if __name__ == "__main__":
     print(url)
 ````
 
+## File: modules/oauth_app.py
+````python
+"""FastAPI routes for Google Drive web OAuth (Fly.io + local)."""
+
+
+
+import os
+
+
+
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, HTTPException, Request
+
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+
+
+from google_auth_oauthlib.flow import Flow
+
+
+
+from modules.drive_client import (
+
+    create_oauth_flow,
+
+    get_drive_service,
+
+    save_credentials,
+
+)
+
+
+
+load_dotenv()
+
+
+
+# Local dev uses http:// redirect URIs; oauthlib requires this for non-HTTPS callbacks.
+
+_redirect_uri = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:8080/oauth/callback")
+
+if _redirect_uri.startswith("http://"):
+
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
+
+
+app = FastAPI(title="Qamar OAuth")
+
+_pending_flows: dict[str, Flow] = {}
+
+
+
+
+
+def _check_link_secret(secret: str | None) -> None:
+
+    expected = os.getenv("OAUTH_LINK_SECRET", "")
+
+    if not expected or secret != expected:
+
+        raise HTTPException(status_code=403, detail="Invalid or missing secret.")
+
+
+
+
+
+def _callback_url(request: Request) -> str:
+
+    url = str(request.url)
+
+    if request.headers.get("x-forwarded-proto") == "https" and url.startswith("http://"):
+
+        url = "https://" + url[7:]
+
+    return url
+
+
+
+
+
+@app.get("/")
+
+def health():
+
+    return {"ok": True, "service": "qamar-bot"}
+
+
+
+
+
+@app.get("/oauth/start")
+
+def oauth_start(secret: str | None = None):
+
+    _check_link_secret(secret)
+
+    flow = create_oauth_flow()
+
+    auth_url, state = flow.authorization_url(
+
+        access_type="offline",
+
+        include_granted_scopes="true",
+
+        prompt="consent",
+
+    )
+
+    _pending_flows[state] = flow
+
+    return RedirectResponse(auth_url)
+
+
+
+
+
+@app.get("/oauth/callback")
+
+def oauth_callback(request: Request):
+
+    state = request.query_params.get("state")
+
+    flow = _pending_flows.pop(state, None) if state else None
+
+    if not flow:
+
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state.")
+
+
+
+    if request.query_params.get("error"):
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail=request.query_params.get("error_description", "OAuth denied."),
+
+        )
+
+
+
+    flow.fetch_token(authorization_response=_callback_url(request))
+
+    save_credentials(flow.credentials)
+
+
+
+    try:
+
+        service = get_drive_service()
+
+        about = service.about().get(fields="user").execute()
+
+        email = about.get("user", {}).get("emailAddress", "your account")
+
+    except Exception:
+
+        email = "your account"
+
+
+
+    return HTMLResponse(
+
+        f"<h1>Google Drive connected</h1>"
+
+        f"<p>Signed in as <strong>{email}</strong>.</p>"
+
+        f"<p>You can close this tab and return to Telegram.</p>"
+
+    )
+````
+
+## File: modules/rate_limit_notify.py
+````python
+"""Track Groq/Gemini daily rate limits and notify users at Pacific midnight."""
+
+import json
+import os
+import tempfile
+from datetime import date, datetime, time, timedelta
+from typing import Literal
+from zoneinfo import ZoneInfo
+
+from telegram import Bot
+from telegram.error import TelegramError
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
+FLAGS_FILE = "brain/rate_limit_notify.json"
+
+Provider = Literal["groq", "gemini"]
+
+
+def pacific_today() -> date:
+    return datetime.now(PACIFIC).date()
+
+
+def format_reset_countdown() -> str:
+    now = datetime.now(PACIFIC)
+    next_midnight = datetime.combine(now.date() + timedelta(days=1), time.min, PACIFIC)
+    delta = next_midnight - now
+    total_minutes = int(delta.total_seconds()) // 60
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _load_flags() -> dict[str, dict]:
+    if not os.path.exists(FLAGS_FILE):
+        return {}
+    try:
+        with open(FLAGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            print(f"[WARN] {FLAGS_FILE} is not a JSON object; ignoring")
+            return {}
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] Could not read {FLAGS_FILE}: {e}")
+        return {}
+
+
+def _save_flags(flags: dict[str, dict]) -> None:
+    os.makedirs(os.path.dirname(FLAGS_FILE), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(FLAGS_FILE), suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(flags, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, FLAGS_FILE)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def mark_rate_limited(user_id: int, provider: Provider) -> None:
+    today = pacific_today().isoformat()
+    flags = _load_flags()
+    key = str(user_id)
+    entry = flags.get(key)
+    if entry and entry.get("date") == today:
+        providers = set(entry.get("providers", []))
+        providers.add(provider)
+        entry["providers"] = sorted(providers)
+    else:
+        flags[key] = {"date": today, "providers": [provider]}
+    _save_flags(flags)
+
+
+def _midnight_reset_message(providers: list[str]) -> str:
+    has_groq = "groq" in providers
+    has_gemini = "gemini" in providers
+    if has_groq and has_gemini:
+        limit_text = "Groq and Gemini limits have"
+    elif has_groq:
+        limit_text = "Groq limits have"
+    else:
+        limit_text = "Gemini limits have"
+    return (
+        f"Good news — your daily {limit_text} reset (midnight Pacific). "
+        "You can send voice notes again."
+    )
+
+
+async def send_midnight_reset_notifications(bot: Bot) -> None:
+    yesterday = (pacific_today() - timedelta(days=1)).isoformat()
+    flags = _load_flags()
+    notified_keys: list[str] = []
+
+    for user_id, entry in flags.items():
+        if not isinstance(entry, dict) or entry.get("date") != yesterday:
+            continue
+        providers = entry.get("providers", [])
+        if not providers:
+            continue
+        text = _midnight_reset_message(providers)
+        try:
+            await bot.send_message(chat_id=int(user_id), text=text)
+            print(f"[INFO] Midnight rate-limit reset notified user {user_id}")
+            notified_keys.append(user_id)
+        except TelegramError as e:
+            print(f"[WARN] Could not notify user {user_id} at midnight: {e}")
+
+    if notified_keys:
+        for key in notified_keys:
+            flags.pop(key, None)
+        _save_flags(flags)
+````
+
+## File: .replit
+````
+entrypoint = "main.py"
+modules = ["python-3.11"]
+
+[nix]
+channel = "stable-24_05"
+
+[unitTest]
+language = "python3"
+
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
+
+[deployment]
+run = ["python3", "main.py"]
+deploymentTarget = "cloudrun"
+````
+
+## File: Dockerfile
+````dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "main.py"]
+````
+
+## File: brain/template.md
+````markdown
+{{date}} {{time}}
+Tags:
+Maturity: baby/teen/adult
+>baby = content needs development, teen = content is quite developed, adult = content is very developed.
+
+___
+# {{Title}}
+
+# References
+N/A
+````
+
 ## File: modules/drive_client.py
 ````python
 """Google Drive uploads using OAuth user credentials (personal Drive quota)."""
@@ -246,6 +585,7 @@ class DriveAuthRequiredError(Exception):
 
 def build_reauth_url() -> str:
     base = os.getenv("BASE_URL", "http://localhost:8080").rstrip("/")
+    # base = os.getenv("BASE_URL", "https://qamar-bot.fly.dev").rstrip("/")
     secret = os.getenv("OAUTH_LINK_SECRET", "")
     if not secret:
         raise ValueError("OAUTH_LINK_SECRET must be set in .env")
@@ -554,297 +894,6 @@ def delete_note_by_id(drive_service, file_id: str) -> str:
     return meta["name"]
 ````
 
-## File: modules/oauth_app.py
-````python
-"""FastAPI routes for Google Drive web OAuth (Fly.io + local)."""
-
-
-
-import os
-
-
-
-from dotenv import load_dotenv
-
-from fastapi import FastAPI, HTTPException, Request
-
-from fastapi.responses import HTMLResponse, RedirectResponse
-
-
-
-from google_auth_oauthlib.flow import Flow
-
-
-
-from modules.drive_client import (
-
-    create_oauth_flow,
-
-    get_drive_service,
-
-    save_credentials,
-
-)
-
-
-
-load_dotenv()
-
-
-
-# Local dev uses http:// redirect URIs; oauthlib requires this for non-HTTPS callbacks.
-
-_redirect_uri = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:8080/oauth/callback")
-
-if _redirect_uri.startswith("http://"):
-
-    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
-
-
-
-app = FastAPI(title="Qamar OAuth")
-
-_pending_flows: dict[str, Flow] = {}
-
-
-
-
-
-def _check_link_secret(secret: str | None) -> None:
-
-    expected = os.getenv("OAUTH_LINK_SECRET", "")
-
-    if not expected or secret != expected:
-
-        raise HTTPException(status_code=403, detail="Invalid or missing secret.")
-
-
-
-
-
-def _callback_url(request: Request) -> str:
-
-    url = str(request.url)
-
-    if request.headers.get("x-forwarded-proto") == "https" and url.startswith("http://"):
-
-        url = "https://" + url[7:]
-
-    return url
-
-
-
-
-
-@app.get("/")
-
-def health():
-
-    return {"ok": True, "service": "qamar-bot"}
-
-
-
-
-
-@app.get("/oauth/start")
-
-def oauth_start(secret: str | None = None):
-
-    _check_link_secret(secret)
-
-    flow = create_oauth_flow()
-
-    auth_url, state = flow.authorization_url(
-
-        access_type="offline",
-
-        include_granted_scopes="true",
-
-        prompt="consent",
-
-    )
-
-    _pending_flows[state] = flow
-
-    return RedirectResponse(auth_url)
-
-
-
-
-
-@app.get("/oauth/callback")
-
-def oauth_callback(request: Request):
-
-    state = request.query_params.get("state")
-
-    flow = _pending_flows.pop(state, None) if state else None
-
-    if not flow:
-
-        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state.")
-
-
-
-    if request.query_params.get("error"):
-
-        raise HTTPException(
-
-            status_code=400,
-
-            detail=request.query_params.get("error_description", "OAuth denied."),
-
-        )
-
-
-
-    flow.fetch_token(authorization_response=_callback_url(request))
-
-    save_credentials(flow.credentials)
-
-
-
-    try:
-
-        service = get_drive_service()
-
-        about = service.about().get(fields="user").execute()
-
-        email = about.get("user", {}).get("emailAddress", "your account")
-
-    except Exception:
-
-        email = "your account"
-
-
-
-    return HTMLResponse(
-
-        f"<h1>Google Drive connected</h1>"
-
-        f"<p>Signed in as <strong>{email}</strong>.</p>"
-
-        f"<p>You can close this tab and return to Telegram.</p>"
-
-    )
-````
-
-## File: modules/rate_limit_notify.py
-````python
-"""Track Groq/Gemini daily rate limits and notify users at Pacific midnight."""
-
-import json
-import os
-import tempfile
-from datetime import date, datetime, time, timedelta
-from typing import Literal
-from zoneinfo import ZoneInfo
-
-from telegram import Bot
-from telegram.error import TelegramError
-
-PACIFIC = ZoneInfo("America/Los_Angeles")
-FLAGS_FILE = "brain/rate_limit_notify.json"
-
-Provider = Literal["groq", "gemini"]
-
-
-def pacific_today() -> date:
-    return datetime.now(PACIFIC).date()
-
-
-def format_reset_countdown() -> str:
-    now = datetime.now(PACIFIC)
-    next_midnight = datetime.combine(now.date() + timedelta(days=1), time.min, PACIFIC)
-    delta = next_midnight - now
-    total_minutes = int(delta.total_seconds()) // 60
-    hours, minutes = divmod(total_minutes, 60)
-    return f"{hours}h {minutes}m"
-
-
-def _load_flags() -> dict[str, dict]:
-    if not os.path.exists(FLAGS_FILE):
-        return {}
-    try:
-        with open(FLAGS_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            print(f"[WARN] {FLAGS_FILE} is not a JSON object; ignoring")
-            return {}
-        return data
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[WARN] Could not read {FLAGS_FILE}: {e}")
-        return {}
-
-
-def _save_flags(flags: dict[str, dict]) -> None:
-    os.makedirs(os.path.dirname(FLAGS_FILE), exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(FLAGS_FILE), suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(flags, f, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, FLAGS_FILE)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
-
-
-def mark_rate_limited(user_id: int, provider: Provider) -> None:
-    today = pacific_today().isoformat()
-    flags = _load_flags()
-    key = str(user_id)
-    entry = flags.get(key)
-    if entry and entry.get("date") == today:
-        providers = set(entry.get("providers", []))
-        providers.add(provider)
-        entry["providers"] = sorted(providers)
-    else:
-        flags[key] = {"date": today, "providers": [provider]}
-    _save_flags(flags)
-
-
-def _midnight_reset_message(providers: list[str]) -> str:
-    has_groq = "groq" in providers
-    has_gemini = "gemini" in providers
-    if has_groq and has_gemini:
-        limit_text = "Groq and Gemini limits have"
-    elif has_groq:
-        limit_text = "Groq limits have"
-    else:
-        limit_text = "Gemini limits have"
-    return (
-        f"Good news — your daily {limit_text} reset (midnight Pacific). "
-        "You can send voice notes again."
-    )
-
-
-async def send_midnight_reset_notifications(bot: Bot) -> None:
-    yesterday = (pacific_today() - timedelta(days=1)).isoformat()
-    flags = _load_flags()
-    notified_keys: list[str] = []
-
-    for user_id, entry in flags.items():
-        if not isinstance(entry, dict) or entry.get("date") != yesterday:
-            continue
-        providers = entry.get("providers", [])
-        if not providers:
-            continue
-        text = _midnight_reset_message(providers)
-        try:
-            await bot.send_message(chat_id=int(user_id), text=text)
-            print(f"[INFO] Midnight rate-limit reset notified user {user_id}")
-            notified_keys.append(user_id)
-        except TelegramError as e:
-            print(f"[WARN] Could not notify user {user_id} at midnight: {e}")
-
-    if notified_keys:
-        for key in notified_keys:
-            flags.pop(key, None)
-        _save_flags(flags)
-````
-
 ## File: modules/user_errors.py
 ````python
 """Map exceptions to short, human-readable Telegram replies."""
@@ -877,7 +926,7 @@ def drive_reauth_message() -> str:
         )
     return (
         "Google Drive is not connected or your login expired.\n"
-        f"Open this link to sign in again:\n{url}\n\n"
+        f"Open this link to sign in again:\n\n{url}\n\n"
         "Or send /reauth in this chat for the same link."
     )
 
@@ -1020,54 +1069,6 @@ def format_user_error(exc: BaseException, *, context: Context) -> str:
         return _generic_drive_message(context)
 
     return _generic_provider_message(context)
-````
-
-## File: .replit
-````
-entrypoint = "main.py"
-modules = ["python-3.11"]
-
-[nix]
-channel = "stable-24_05"
-
-[unitTest]
-language = "python3"
-
-[gitHubImport]
-requiredFiles = [".replit", "replit.nix"]
-
-[deployment]
-run = ["python3", "main.py"]
-deploymentTarget = "cloudrun"
-````
-
-## File: Dockerfile
-````dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-CMD ["python", "main.py"]
-````
-
-## File: brain/template.md
-````markdown
-{{date}} {{time}}
-Tags:
-Maturity: baby/teen/adult
->baby = content needs development, teen = content is quite developed, adult = content is very developed.
-
-___
-# {{Title}}
-
-# References
-N/A
 ````
 
 ## File: pyproject.toml
@@ -1735,8 +1736,8 @@ async def draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Book Review", callback_data="draft-type:book"),
-                InlineKeyboardButton("Burning Thought", callback_data="draft-type:thought"),
+                InlineKeyboardButton("Book Review", callback_data="draft_type:book"),
+                InlineKeyboardButton("Burning Thought", callback_data="draft_type:thought"),
             ],
             [
                 InlineKeyboardButton("Cancel", callback_data="draft_cancel")
@@ -1767,9 +1768,9 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # if user chose "book" or "thought" (refreshed)
     if data.startswith("draft_type:") or data.startswith("draft_refresh:"):
-        post_type = data.splot(":")[1]          # "book" or "thought"
+        post_type = data.split(":")[1]          # "book" or "thought"
 
-        await query.edit_message_text("scanning cault and picking 3 random notes ... gimme a sec")
+        await query.edit_message_text("scanning vault and picking 3 random notes ... gimme a sec")
 
         try:
             drive_service = get_drive_service()
@@ -1794,7 +1795,7 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chosen_sample.sort(key=lambda x: x["createdTime"], reverse=True)
 
             # store selection in user context state
-            context.user_data["suggetsed_notes"] = chosen_sample
+            context.user_data["suggested_notes"] = chosen_sample
             context.user_data["draft_post_type"] = post_type
             context.user_data["draft_state"] = "awaiting_selection"
 
@@ -1803,15 +1804,15 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg_text = f"here are 3 random {post_label} suggestions, sorted latest first:\n\n"
 
             for idx, note in enumerate(chosen_sample, start=1):
-                created = format_drive_created_time(note[["createdTime"]])
+                created = format_drive_created_time(note["createdTime"])
                 msg_text += f"{idx}. {note['name']} (created: {created})\n"
 
             msg_text += "\nuse the buttons below to act."
 
             keyboard = InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Refresh suggestions", callback_data=f"data_refresh:{post_type}")],
-                    [InlineKeyboardButton("Cancel", callback_data="data_cancel")],
+                    [InlineKeyboardButton("Refresh suggestions", callback_data=f"draft_refresh:{post_type}")],
+                    [InlineKeyboardButton("Cancel", callback_data="draft_cancel")],
                 ]
             )
 
@@ -1824,7 +1825,7 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # "Captures manual numerical replies when choosing a note.
+    """Captures manual numerical replies when choosing a note."""
     state = context.user_data.get("draft_state")
     if state == "awaiting_selection":
         text = update.message.text.strip()
@@ -2016,6 +2017,25 @@ async def midnight_rate_limit_job(context: ContextTypes.DEFAULT_TYPE):
     await send_midnight_reset_notifications(context.bot)
 
 
+
+async def debug_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Temporary debug handler that prints any button click to the console."""
+    query = update.callback_query
+    # Acknowledge the click immediately so the loading spinner stops
+    await query.answer()
+    
+    # Print the exact incoming data to your terminal/logs
+    print(f"\n[DEBUG] A button was pressed!")
+    print(f"-> Callback Data received: '{query.data}'")
+    print(f"-> User who clicked: {update.effective_user.username} (ID: {update.effective_user.id})\n")
+    
+    # Send a quick text back to the user to confirm it works
+    await query.message.reply_text(f"debug: caught button press with data -> {query.data}")
+
+
+
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_http_server, daemon=True).start()
 
@@ -2028,20 +2048,28 @@ if __name__ == "__main__":
             time=datetime.time(0, 0, tzinfo=PACIFIC),
             name="pacific_midnight_rate_limit_reset",
         )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reauth", reauth))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("draft", draft))
+    
+    # Handles delete confirmation/cancellation buttons
     app.add_handler(
         CallbackQueryHandler(delete_callback, pattern=f"^({DELETE_CONFIRM}|{DELETE_CANCEL})$")
     )
+    
+    # Handles the /draft post type selection, refresh, and cancel buttons
     app.add_handler(
-        CallbackQueryHandler(delete_callback, pattern=f"^({DELETE_CONFIRM}|{DELETE_CANCEL})$")
+        CallbackQueryHandler(
+            draft_callback, 
+            pattern=r"^(draft_type:|draft_refresh:|draft_cancel)"
+        )
     )
+    
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Handles text inputs (1, 2, or 3) for choosing suggested notes
-    # We place it after voice and other handlers to ensure it doesn't intercept commands
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print(f"Qamar is live (OAuth server on port {HTTP_PORT}).")

@@ -24,6 +24,8 @@ _drive_service = None
 
 _DEBUG_LOG_PATH = "debug-5b8722.log"
 
+INDEX_FILE = os.path.join(os.path.dirname(__file__), "..", "brain", "notes_index.json")
+
 
 def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
     # #region agent log
@@ -360,3 +362,34 @@ def delete_note_by_id(drive_service, file_id: str) -> str:
     meta = drive_service.files().get(fileId=file_id, fields="name").execute()
     drive_service.files().delete(fileId=file_id).execute()
     return meta["name"]
+
+
+# cache notes to get all notes faster
+def save_notes_index(notes: list[dict]) -> None:
+    """Saves vault note metadata (id, name, createdTime, tags) to a local file."""
+    os.makedirs(os.path.dirname(INDEX_FILE), exist_ok=True)
+    
+    # Store clean metadata without full content to keep index light
+    index_data = [
+        {
+            "id": n["id"],
+            "name": n["name"],
+            "createdTime": n.get("createdTime", ""),
+            "tags": n.get("tags", [])
+        }
+        for n in notes
+    ]
+    
+    with open(INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(index_data, f, indent=2)
+
+def load_notes_index() -> list[dict]:
+    """Loads cached vault note metadata from local storage."""
+    if not os.path.exists(INDEX_FILE):
+        return []
+    try:
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Failed to load notes index: {e}")
+        return []

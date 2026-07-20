@@ -34,6 +34,8 @@ from modules.drive_client import (
     get_most_recent_note,
     list_vault_notes,
     save_note_to_drive,
+    save_notes_index,
+    load_notes_index,
 )
 from modules.oauth_app import app as fastapi_app
 from modules.rate_limit_notify import PACIFIC, mark_rate_limited, send_midnight_reset_notifications
@@ -299,7 +301,7 @@ async def draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# /draft process after selecting postt ype/note refresh
+# /draft process after selecting post type/note refresh
 async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -316,62 +318,65 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # if user chose "book" or "thought" (refreshed)
     if data.startswith("draft_type:") or data.startswith("draft_refresh:"):
-        post_type = data.split(":")[1]          # "book" or "thought"
+        post_type = data.split(":")[1]
 
-        await query.edit_message_text("scanning vault and picking 3 random notes ... gimme a sec")
+        # 1. Load instantly from local cache file instead of fetching Drive API
+        all_notes = load_notes_index()
 
-        try:
+        # If index is empty (e.g. initial run before syncing), perform fallback fetch and save
+        if not all_notes:
+            await query.edit_message_text("index file empty. scanning drive vault for first time...")
             drive_service = get_drive_service()
             all_notes = get_all_vault_notes_concurrently(drive_service)
+            save_notes_index(all_notes)
 
-            # only get ntoes with [[book]] tag
-            matching_notes = []
-            for note in all_notes:
-                is_book = "book" in note["tags"]
-                if (post_type == "book" and is_book) or (post_type == "thought" and not is_book):
-                    matching_notes.append(note)
+        # 2. Filter using local tag metadata
+        matching_notes = []
+        for note in all_notes:
+            is_book = "book" in note.get("tags", [])
+            if (post_type == "book" and is_book) or (post_type == "thought" and not is_book):
+                matching_notes.append(note)
 
-            if not matching_notes:
-                await query.edit_message_text(
-                    f"no notes found matching the '{'book' if post_type == 'book' else 'burning thought'}' type"
-                )
-                return
-
-            # show 3 random  notes
-            chosen_sample = random.sample(matching_notes, min(3, len(matching_notes)))
-            # sort notes in descending order by creation date (latest first)
-            chosen_sample.sort(key=lambda x: x["createdTime"], reverse=True)
-
-            # store selection in user context state
-            context.user_data["suggested_notes"] = chosen_sample
-            context.user_data["draft_post_type"] = post_type
-            context.user_data["draft_state"] = "awaiting_selection"
-
-            # Format output message
-            post_label = "book review" if post_type == "book" else "burning thought"
-            msg_text = f"here are 3 random {post_label} suggestions, sorted latest first:\n\n"
-
-            for idx, note in enumerate(chosen_sample, start=1):
-                created = format_drive_created_time(note["createdTime"])
-                msg_text += f"{idx}. {note['name']} (created: {created})\n"
-
-            msg_text += "\nuse the buttons below to act."
-
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("Refresh suggestions", callback_data=f"draft_refresh:{post_type}")],
-                    [InlineKeyboardButton("Cancel", callback_data="draft_cancel")],
-                ]
+        if not matching_notes:
+            await query.edit_message_text(
+                f"no notes found matching the '{'book' if post_type == 'book' else 'burning thought'}' type. try running /sync"
             )
+            return
 
-            await query.edit_message_text(msg_text, reply_markup=keyboard)
+        # 3. Select 3 random and sort latest first
+        chosen_sample = random.sample(matching_notes, min(3, len(matching_notes)))
+        chosen_sample.sort(key=lambda x: x.get("createdTime", ""), reverse=True)
 
-        except Exception as e:
-            print(f"[ERROR] Note categorisation failed: {e}")
-            await query.edit_message_text(format_user_error(e, context="drive_lookup"))
+        # store selection in user context state
+        context.user_data["suggested_notes"] = chosen_sample
+        context.user_data["draft_post_type"] = post_type
+        context.user_data["draft_state"] = "awaiting_selection"
+
+        # Format output message
+        post_label = "book review" if post_type == "book" else "burning thought"
+        msg_text = f"here are 3 random {post_label} suggestions, sorted latest first:\n\n"
+
+        for idx, note in enumerate(chosen_sample, start=1):
+            created = format_drive_created_time(note["createdTime"])
+            msg_text += f"{idx}. {note['name']} (created: {created})\n"
+
+        msg_text += "\nuse the buttons below to act."
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Refresh suggestions", callback_data=f"draft_refresh:{post_type}")],
+                [InlineKeyboardButton("Cancel", callback_data="draft_cancel")],
+            ]
+        )
+
+        await query.edit_message_text(msg_text, reply_markup=keyboard)
+
+        # except Exception as e:
+        #     print(f"[ERROR] Note categorisation failed: {e}")
+        #     await query.edit_message_text(format_user_error(e, context="drive_lookup"))
 
 
-
+# take user's number reply to draft post
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Captures manual numerical replies when choosing a note."""
     state = context.user_data.get("draft_state")
@@ -397,7 +402,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("type 1, 2, or 3 to pick a note. or cancel using the inline buttons.")
 
 
-
+# generate post draft with template
 async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_TYPE, selected_note: dict, post_type: str):
     # Generates and splits the lowercase carousel draft using Gemini.
     await update.message.reply_text(f"drafting slides for '{selected_note['name']}'... ✍️")
@@ -409,13 +414,14 @@ async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_
                 "Format of the book review slides:\n"
                 "Slide 1: <book title> by <author>\n"
                 "Slide 2: Summary of the book in my own words (rely on content within the note)\n"
-                "Slide 3: Opinion and feelings about the book\n"
-                "Slide 4: Would I read it again?\n"
+                "Slide 3: Most popular quotes from that book based on Goodreads.com\n"
+                "Slide 4: Personal pinion and feelings about the book in my own words (rely on content within the note)\n"
+                "Slide 5: Would I read it again?\n"
             )
         else:
             framework = (
                 "Format of the burning thought slides:\n"
-                "Slide 1: Hook\n"
+                "Slide 1: Irresistible one-liner hook\n"
                 "Slide 2: Inspiration or context on how this thought came to be\n"
                 "Slide 3: Explain the thought clearly in simple, casual terms\n"
                 "Slide 4: Next course of action while knowing this thought\n"
@@ -429,15 +435,19 @@ async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_
             "- Write exactly in the speaking/writing style of the note itself (casual, easygoing, nonchalant, authentic).\n"
             "- Do not use ANY text formatting. No asterisks (*), no bold, no headers.\n"
             "- Do not include headers, slide numbers, or slide labels (e.g., do not output 'slide 1:' or 'hook:'). Only write the pure content of each slide.\n"
+            "- Write the content from a personal prnoun perspective, using 'I' and 'me'. Not 'you'. \n"
             "- Separate each slide's content using a line with exactly three hyphens: '---'."
         )
 
         full_system_prompt = qamar_system_prompt + "\n\n" + instructions
 
+        drive_service = get_drive_service()
+        full_content = download_note_content(drive_service, selected_note["id"])
+
         response = gemini_client.models.generate_content(
             model=gemini_model,
             contents=(
-                f"Here is the Obsidian note content:\n\n{selected_note['content']}\n\n"
+                f"Here is the Obsidian note content:\n\n{full_content}\n\n"
                 "Draft the carousel slides now following the layout and constraints perfectly."
             ),
             config=types.GenerateContentConfig(system_instruction=full_system_prompt),
@@ -460,6 +470,25 @@ async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_
         if is_rate_limit(e) and update.effective_user:
             mark_rate_limited(update.effective_user.id, "gemini")
         await update.message.reply_text(format_user_error(e, context="gemini"))
+
+
+# /sync: cache obsidian notes
+async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to trigger a manual scan of Google Drive and save local notes index."""
+    msg = await update.message.reply_text("🔄 scanning google drive vault and updating index...")
+    
+    try:
+        drive_service = get_drive_service()
+        # Scan drive and extract tags
+        all_notes = get_all_vault_notes_concurrently(drive_service)
+        
+        # Save to local brain/notes_index.json
+        save_notes_index(all_notes)
+        
+        await msg.edit_text(f"✅ synced successfully! indexed **{len(all_notes)}** notes.", parse_mode="Markdown")
+    except Exception as e:
+        print(f"[ERROR] Sync failed: {e}")
+        await msg.edit_text(f"❌ failed to sync notes: {e}")
 
         
 
@@ -601,6 +630,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reauth", reauth))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("draft", draft))
+    app.add_handler(CommandHandler("sync", sync))
     
     # Handles delete confirmation/cancellation buttons
     app.add_handler(
