@@ -146,20 +146,13 @@ def note_filename_from_markdown(markdown: str) -> str:
 def format_drive_created_time(created_time_rfc3339: str) -> str:
     """Safely parse Google Drive timestamps."""
     if not created_time_rfc3339:
-        return "Unknown"
+        return datetime.datetime.now(timezone.utc)
     
-    try:
-        # Standardize the RFC3339 timestamp for Python's datetime parser
-        # Handles both 'Z' and trailing fractional seconds safely
-        clean_time = created_time_rfc3339.strip()
-        if clean_time.endswith("Z"):
-            clean_time = clean_time[:-1] + "+00:00"
-            
-        dt = datetime.datetime.fromisoformat(clean_time)
-        return dt.astimezone(timezone.utc).strftime("%d-%m-%Y %H:%M")
-    except Exception as e:
-        print(f"[WARN] Failed to parse time '{created_time_rfc3339}': {e}")
-        return created_time_rfc3339
+    # Ensure 'Z' is wrapped in quotes so Python treats it as a string
+    normalized_time = created_time_rfc3339.replace("Z", "+00:00")
+    dt = datetime.datetime.fromisoformat(normalized_time)
+    
+    return dt.astimezone(timezone.utc)
 
 
 
