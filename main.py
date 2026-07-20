@@ -144,15 +144,9 @@ def note_filename_from_markdown(markdown: str) -> str:
 
 # Prompt user to reauth Google Drive access
 def format_drive_created_time(created_time_rfc3339: str) -> str:
-    """Safely parse Google Drive timestamps."""
-    if not created_time_rfc3339:
-        return datetime.datetime.now(timezone.utc)
-    
-    # Ensure 'Z' is wrapped in quotes so Python treats it as a string
-    normalized_time = created_time_rfc3339.replace("Z", "+00:00")
-    dt = datetime.datetime.fromisoformat(normalized_time)
-    
-    return dt.astimezone(timezone.utc)
+    dt = datetime.datetime.fromisoformat(created_time_rfc3339.replace("Z", "+00:00"))
+    return dt.astimezone(TZ).strftime("%d-%m-%Y %H:%M")
+
 
 
 
