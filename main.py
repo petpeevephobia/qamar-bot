@@ -5,7 +5,6 @@ import datetime
 import tempfile
 import threading
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 TZ = ZoneInfo(os.getenv("QAMAR_TIMEZONE", "Europe/Berlin"))
 
@@ -168,22 +167,16 @@ def fetch_single_note_metadata(drive_service, note: dict) -> dict | None:
 
 
 # Download note contents (in parallel to avoid slow sequential APIs)
-def get_all_vault_notes_concurrently(drive_service) -> list[dict]:
+def get_all_vault_notes(drive_service) -> list[dict]:
+    """Fetch all vault notes and their metadata sequentially to prevent thread-safety corruption."""
     all_notes = list_vault_notes(drive_service)
     results = []
-    
-    # Use ThreadPoolExecutor safely with explicit futures mapping
-    with ThreadPoolExecutor(max_workers=5) as executor:  # Lower max_workers to 5 to prevent Drive API rate limits
-        future_to_note = {
-            executor.submit(fetch_single_note_metadata, drive_service, note): note 
-            for note in all_notes
-        }
-        
-        for future in as_completed(future_to_note):
-            res = future.result()
-            if res is not None:
-                results.append(res)
-                
+    Z
+    for note in all_notes:
+        res = fetch_single_note_metadata(drive_service, note)
+        if res is not None:
+            results.append(res)
+            
     return results
 
 
@@ -343,7 +336,7 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not all_notes:
             await query.edit_message_text("index file empty. scanning drive vault for first time...")
             drive_service = get_drive_service()
-            all_notes = get_all_vault_notes_concurrently(drive_service)
+            all_notes = get_all_vault_notes(drive_service)
             save_notes_index(all_notes)
 
         # 2. Filter using local tag metadata
@@ -496,7 +489,7 @@ async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         drive_service = get_drive_service()
         # Scan drive and extract tags
-        all_notes = get_all_vault_notes_concurrently(drive_service)
+        all_notes = get_all_vault_notes(drive_service)
         
         # Save to local brain/notes_index.json
         save_notes_index(all_notes)
