@@ -323,6 +323,11 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 1. Load instantly from local cache file instead of fetching Drive API
         all_notes = load_notes_index()
 
+        # DEBUG
+        for n in all_notes:
+            print(f"Note: '{n.get('name')}' | Tags: {n.get('tags')}")
+        print("---------------------------------------------------\n")
+
         # If index is empty (e.g. initial run before syncing), perform fallback fetch and save
         if not all_notes:
             await query.edit_message_text("index file empty. scanning drive vault for first time...")
