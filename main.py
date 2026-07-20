@@ -5,7 +5,7 @@ import datetime
 import tempfile
 import threading
 import random
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 TZ = ZoneInfo(os.getenv("QAMAR_TIMEZONE", "Europe/Berlin"))
 
@@ -170,10 +170,21 @@ def fetch_single_note_metadata(drive_service, note: dict) -> dict | None:
 # Download note contents (in parallel to avoid slow sequential APIs)
 def get_all_vault_notes_concurrently(drive_service) -> list[dict]:
     all_notes = list_vault_notes(drive_service)
-    # 10 worker heads -> pull note metadata very fast
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(lambda n: fetch_single_note_metadata(drive_service, n), all_notes))
-    return [r for r in results if r is not None]
+    results = []
+    
+    # Use ThreadPoolExecutor safely with explicit futures mapping
+    with ThreadPoolExecutor(max_workers=5) as executor:  # Lower max_workers to 5 to prevent Drive API rate limits
+        future_to_note = {
+            executor.submit(fetch_single_note_metadata, drive_service, note): note 
+            for note in all_notes
+        }
+        
+        for future in as_completed(future_to_note):
+            res = future.result()
+            if res is not None:
+                results.append(res)
+                
+    return results
 
 
 
