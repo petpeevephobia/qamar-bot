@@ -421,8 +421,8 @@ async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_
                 "Format of the book review slides:\n"
                 "Slide 1: <book title> by <author>\n"
                 "Slide 2: Summary of the book in my own words (rely on content within the note)\n"
-                "Slide 3: Most popular quotes from that book based on Goodreads.com\n"
-                "Slide 4: Personal pinion and feelings about the book in my own words (rely on content within the note)\n"
+                "Slide 3: 5 most popular quotes directly from that book based on Goodreads.com\n"
+                "Slide 4: Personal opinion and feelings about the book in my own words (rely on content within the note)\n"
                 "Slide 5: Would I read it again?\n"
             )
         else:
@@ -430,9 +430,10 @@ async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_
                 "Format of the burning thought slides:\n"
                 "Slide 1: Irresistible one-liner hook\n"
                 "Slide 2: Inspiration or context on how this thought came to be\n"
-                "Slide 3: Explain the thought clearly in simple, casual terms\n"
+                "Slide 3 ...: Explain the thought clearly in simple, casual terms OR split the information into 3 separate slides. Each slide can have a maximum of 2 points.\n"
                 "Slide 4: Next course of action while knowing this thought\n"
                 "Slide 5: Close with an ambiguous statement to provoke thinking\n"
+                "Slide 6: Citations from the references section of the note, if any. If no references, skip this slide\n"
             )
 
         instructions = (
@@ -442,7 +443,7 @@ async def generate_carousel_draft(update: Update, context: ContextTypes.DEFAULT_
             "- Write exactly in the speaking/writing style of the note itself (casual, easygoing, nonchalant, authentic).\n"
             "- Do not use ANY text formatting. No asterisks (*), no bold, no headers.\n"
             "- Do not include headers, slide numbers, or slide labels (e.g., do not output 'slide 1:' or 'hook:'). Only write the pure content of each slide.\n"
-            "- Write the content from a personal prnoun perspective, using 'I' and 'me'. Not 'you'. \n"
+            "- Write the content from a personal pronoun perspective, using 'i' and 'me'. Not 'you'. \n"
             "- Separate each slide's content using a line with exactly three hyphens: '---'."
         )
 
