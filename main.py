@@ -31,7 +31,8 @@ from dotenv import load_dotenv
 # System
 import os
 import re
-from datetime import datetime, timezone
+import datetime
+from datetime import timezone
 import tempfile
 import threading
 import random
@@ -143,16 +144,22 @@ def note_filename_from_markdown(markdown: str) -> str:
 
 # Prompt user to reauth Google Drive access
 def format_drive_created_time(created_time_rfc3339: str) -> str:
-    """Safely parse Google Drive RFC3339 timestamps containing 'Z'."""
+    """Safely parse Google Drive timestamps."""
     if not created_time_rfc3339:
-        return datetime.now(timezone.utc)
+        return "Unknown"
     
-    # Replace the trailing 'Z' with '+00:00' so Python's fromisoformat understands it
-    normalized_time = created_time_rfc3339.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(normalized_time)
-    
-    # Ensure it has timezone awareness
-    return dt.astimezone(timezone.utc)
+    try:
+        # Standardize the RFC3339 timestamp for Python's datetime parser
+        # Handles both 'Z' and trailing fractional seconds safely
+        clean_time = created_time_rfc3339.strip()
+        if clean_time.endswith("Z"):
+            clean_time = clean_time[:-1] + "+00:00"
+            
+        dt = datetime.datetime.fromisoformat(clean_time)
+        return dt.astimezone(timezone.utc).strftime("%d-%m-%Y %H:%M")
+    except Exception as e:
+        print(f"[WARN] Failed to parse time '{created_time_rfc3339}': {e}")
+        return created_time_rfc3339
 
 
 
@@ -387,10 +394,6 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await query.edit_message_text(msg_text, reply_markup=keyboard)
-
-        # except Exception as e:
-        #     print(f"[ERROR] Note categorisation failed: {e}")
-        #     await query.edit_message_text(format_user_error(e, context="drive_lookup"))
 
 
 # take user's number reply to draft post
