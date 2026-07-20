@@ -179,7 +179,7 @@ def get_all_vault_notes(drive_service) -> list[dict]:
     """Fetch all vault notes and their metadata sequentially to prevent thread-safety corruption."""
     all_notes = list_vault_notes(drive_service)
     results = []
-    Z
+
     for note in all_notes:
         res = fetch_single_note_metadata(drive_service, note)
         if res is not None:
