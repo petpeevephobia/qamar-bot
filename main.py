@@ -1,18 +1,3 @@
-# System
-import os
-import re
-import datetime
-import tempfile
-import threading
-import random
-from zoneinfo import ZoneInfo
-TZ = ZoneInfo(os.getenv("QAMAR_TIMEZONE", "Europe/Berlin"))
-
-import uvicorn
-from dotenv import load_dotenv
-
-load_dotenv()
-
 # APIs
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -39,6 +24,21 @@ from modules.drive_client import (
 from modules.oauth_app import app as fastapi_app
 from modules.rate_limit_notify import PACIFIC, mark_rate_limited, send_midnight_reset_notifications
 from modules.user_errors import drive_reauth_message, format_user_error, is_rate_limit
+
+import uvicorn
+from dotenv import load_dotenv
+
+# System
+import os
+import re
+from datetime import datetime, timezone
+import tempfile
+import threading
+import random
+from zoneinfo import ZoneInfo
+TZ = ZoneInfo(os.getenv("QAMAR_TIMEZONE", "Europe/Berlin"))
+
+load_dotenv()
 
 now = datetime.datetime.now()
 
@@ -143,8 +143,16 @@ def note_filename_from_markdown(markdown: str) -> str:
 
 # Prompt user to reauth Google Drive access
 def format_drive_created_time(created_time_rfc3339: str) -> str:
-    dt = datetime.datetime.fromisoformat(created_time_rfc3339.replace("Z", "+00:00"))
-    return dt.astimezone(TZ).strftime("%d-%m-%Y %H:%M")
+    """Safely parse Google Drive RFC3339 timestamps containing 'Z'."""
+    if not created_time_rfc3339:
+        return datetime.now(timezone.utc)
+    
+    # Replace the trailing 'Z' with '+00:00' so Python's fromisoformat understands it
+    normalized_time = created_time_rfc3339.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(normalized_time)
+    
+    # Ensure it has timezone awareness
+    return dt.astimezone(timezone.utc)
 
 
 
